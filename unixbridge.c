@@ -27,6 +27,32 @@ static char *wstr_to_utf8_alloc(const wchar_t *ws) {
     return out;
 }
 
+struct proxy_args {
+    HANDLE hWin;
+    int unix_fd;
+    int to_unix;
+};
+
+static DWORD WINAPI proxy_thread(LPVOID lpParam) {
+    struct proxy_args *args = lpParam;
+    char buf[4096];
+    DWORD dwRead, dwWritten;
+
+    if (args->to_unix) {
+        while (ReadFile(args->hWin, buf, sizeof(buf), &dwRead, NULL) && dwRead > 0) {
+            if (write(args->unix_fd, buf, dwRead) <= 0) break;
+        }
+        close(args->unix_fd);
+    } else {
+        ssize_t n;
+        while ((n = read(args->unix_fd, buf, sizeof(buf))) > 0) {
+            if (!WriteFile(args->hWin, buf, (DWORD) n, &dwWritten, NULL)) break;
+        }
+    }
+    free(args);
+    return 0;
+}
+
 int __cdecl unix_bridge_exec(const int argc, wchar_t **argv_w, const wchar_t *target_name_w) {
     char *target_name = wstr_to_utf8_alloc(target_name_w);
     const char *env_target = getenv("UNIX_BRIDGE_TARGET");
@@ -71,6 +97,15 @@ int __cdecl unix_bridge_exec(const int argc, wchar_t **argv_w, const wchar_t *ta
 
     fflush(NULL);
 
+    int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
+    if (pipe(stdin_pipe) == -1 || pipe(stdout_pipe) == -1 || pipe(stderr_pipe) == -1) {
+        perror("unixbridge: pipe failed");
+        for (int i = 0; i < out_argc; i++) free(argv[i]);
+        free(target_name);
+        free(argv);
+        return 111;
+    }
+
     pid_t pid = fork();
     if (pid == -1) {
         perror("unixbridge: fork failed");
@@ -80,6 +115,17 @@ int __cdecl unix_bridge_exec(const int argc, wchar_t **argv_w, const wchar_t *ta
         return 111;
     } else if (pid == 0) {
         /* Child process */
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+
+        close(stdin_pipe[0]);
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[0]);
+        close(stderr_pipe[1]);
+
         execvp(exec_path, argv);
         /* If execvp returns, it failed */
         if (errno == ENOENT) {
@@ -96,6 +142,31 @@ int __cdecl unix_bridge_exec(const int argc, wchar_t **argv_w, const wchar_t *ta
         _exit(127);
     } else {
         /* Parent process */
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+
+        HANDLE threads[3];
+        struct proxy_args *a;
+
+        a = malloc(sizeof(*a));
+        a->hWin = GetStdHandle(STD_INPUT_HANDLE);
+        a->unix_fd = stdin_pipe[1];
+        a->to_unix = 1;
+        threads[0] = CreateThread(NULL, 0, proxy_thread, a, 0, NULL);
+
+        a = malloc(sizeof(*a));
+        a->hWin = GetStdHandle(STD_OUTPUT_HANDLE);
+        a->unix_fd = stdout_pipe[0];
+        a->to_unix = 0;
+        threads[1] = CreateThread(NULL, 0, proxy_thread, a, 0, NULL);
+
+        a = malloc(sizeof(*a));
+        a->hWin = GetStdHandle(STD_ERROR_HANDLE);
+        a->unix_fd = stderr_pipe[0];
+        a->to_unix = 0;
+        threads[2] = CreateThread(NULL, 0, proxy_thread, a, 0, NULL);
+
         int status;
         int exit_code = 127;
 
@@ -107,6 +178,13 @@ int __cdecl unix_bridge_exec(const int argc, wchar_t **argv_w, const wchar_t *ta
         } else if (WIFSIGNALED(status)) {
             exit_code = 128 + WTERMSIG(status);
         }
+
+        /* Signal threads to exit if they haven't already */
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+
+        WaitForMultipleObjects(3, threads, TRUE, 1000); // Wait a bit for threads to flush
+        for (int i = 0; i < 3; i++) CloseHandle(threads[i]);
 
         for (int i = 0; i < out_argc; i++) free(argv[i]);
         free(target_name);
