@@ -78,16 +78,11 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }} \
             make -j$(nproc) ${{ matrix.arch }}
 
-      - name: Prepare artifact
-        run: |
-          cd build/${{ matrix.arch }}
-          zip -j ../../wine_unix_bridge-linux-${{ matrix.arch }}.zip unixbridge.exe unixbridge.dll
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: wine_unix_bridge-linux-${{ matrix.arch }}
-          path: wine_unix_bridge-linux-${{ matrix.arch }}.zip
+          path: build/${{ matrix.arch }}
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -97,16 +92,28 @@ jobs:
       contents: write
 
     steps:
-      - name: Download artifacts
+      - name: Download artifacts (x64)
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
-
+          name: wine_unix_bridge-linux-x64
+          path: build/x64
+    
+      - name: Download artifacts (x86)
+        uses: actions/download-artifact@v4
+        with:
+          name: wine_unix_bridge-linux-x86
+          path: build/x86
+    
+      - name: Zip artifacts
+        run: |
+          cd build
+          zip -j ../wine_unix_bridge-linux-x64.zip x64/unixbridge.exe x64/unixbridge.dll
+          zip -j ../wine_unix_bridge-linux-x86.zip x86/unixbridge.exe x86/unixbridge.dll
+    
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/wine_unix_bridge-linux-x64.zip
-            artifacts/wine_unix_bridge-linux-x86.zip
+            wine_unix_bridge-linux-x64.zip
+            wine_unix_bridge-linux-x86.zip
           generate_release_notes: true
